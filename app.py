@@ -1,6 +1,13 @@
 # -*- coding: utf-8 -*-
+# ===== AMP 완전 OFF + FP16 가중치 로드(메모리 절약) 고정 =====
 import os, json, re, random, math
-os.environ["TOKENIZERS_PARALLELISM"] = "false"   # 포크/데드락 경고 방지
+
+# ✅ 슬럼/Accelerate 기본 혼합정밀 설정 무력화 (가장 중요)
+os.environ["ACCELERATE_MIXED_PRECISION"] = "no"
+# 토크나이저 포크 경고 억제
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# (선택) CUDA 메모리 조각화 완화
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import numpy as np
 import torch
@@ -56,7 +63,7 @@ raw_dset = DatasetDict({
 # =========================
 MODEL_NAME = "openlm-research/open_llama_3b"
 
-# 메모리 완화: 시퀀스 길이 단축 (필요시 64로 더 낮추기)
+# 메모리 완화: 시퀀스 길이 단축
 MAX_LEN = 80
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
@@ -75,13 +82,13 @@ device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "c
 bf16 = False  # 3090은 bf16 미지원
 
 print("모델 로드 전")
-# ✅ 항상 FP16 가중치로 로드 (메모리 절약) — AMP는 끈다
+# ✅ 가중치는 FP16으로 로드(메모리 절약) + AMP는 완전 OFF(GradScaler 비사용)
 model = LlamaForSequenceClassification.from_pretrained(
     MODEL_NAME,
     num_labels=len(LABELS),
     id2label=id2label,
     label2id=label2id,
-    torch_dtype=torch.float16,     # <-- 항상 half로 로드
+    torch_dtype=torch.float16,     # half로 로드하되 AMP 비사용
     low_cpu_mem_usage=True,
 )
 print("모델 로드 후")
@@ -153,7 +160,7 @@ args = TrainingArguments(
     gradient_accumulation_steps=GRAD_ACC,
     weight_decay=0.05,
 
-    # ✅ GradScaler 경로 자체를 사용하지 않으므로 클리핑 off 유지(원하면 1.0으로 켜도 됨)
+    # ✅ AMP/GradScaler를 절대 쓰지 않으므로 클리핑 0.0 유지(원하면 1.0로 변경 가능)
     max_grad_norm=0.0,
 
     lr_scheduler_type="cosine",
@@ -168,15 +175,15 @@ args = TrainingArguments(
     metric_for_best_model="macro_f1",
     greater_is_better=True,
 
-    # ✅ AMP/GradScaler 완전 OFF
+    # ✅ AMP 완전 OFF
     fp16=False,
     bf16=bf16,
-    optim="adamw_torch",
+    optim="adamw_torch",           # 가능하면 "adamw_torch_fused"로 교체해도 됨
 
     gradient_checkpointing=True,
     gradient_checkpointing_kwargs={"use_reentrant": False},
 
-    dataloader_num_workers=0,  # 슬럼/포크 환경에서 안전
+    dataloader_num_workers=0,      # 슬럼/포크 환경에서 안전
     report_to="none",
     seed=SEED,
 )
@@ -261,6 +268,7 @@ if DO_TUNE:
             metric_for_best_model="macro_f1",
             greater_is_better=True,
 
+            # ✅ AMP 완전 OFF (트라이얼도 동일 정책)
             fp16=False,
             bf16=bf16,
             optim="adamw_torch",
@@ -275,6 +283,9 @@ if DO_TUNE:
         return a, patience
 
     def objective(trial):
+        # 혹시 모를 외부 설정 방어
+        os.environ["ACCELERATE_MIXED_PRECISION"] = "no"
+
         m = LlamaForSequenceClassification.from_pretrained(
             MODEL_NAME,
             num_labels=len(LABELS),
@@ -343,6 +354,7 @@ if DO_TUNE:
     print("Best params:", study.best_trial.params)
 
     df_trials = pd.DataFrame(trial_logs)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     df_trials.to_csv(f"{OUTPUT_DIR}/optuna_results.csv", index=False)
 
     topk = df_trials.sort_values("val_f1", ascending=False).head(5)
