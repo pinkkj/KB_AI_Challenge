@@ -1,12 +1,10 @@
 # -*- coding: utf-8 -*-
-# ===== AMP 완전 OFF + FP16 가중치 로드(메모리 절약) 고정 =====
+# ===== QLoRA(4-bit) + LoRA + paged AdamW 8bit / AMP 완전 OFF =====
 import os, json, re, random, math
 
-# ✅ 슬럼/Accelerate 기본 혼합정밀 설정 무력화 (가장 중요)
+# ✅ 혼합정밀/GradScaler 완전 차단 (가장 중요)
 os.environ["ACCELERATE_MIXED_PRECISION"] = "no"
-# 토크나이저 포크 경고 억제
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-# (선택) CUDA 메모리 조각화 완화
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import numpy as np
@@ -20,7 +18,9 @@ from transformers import (
     Trainer,
     DataCollatorWithPadding,
     EarlyStoppingCallback,
+    BitsAndBytesConfig,
 )
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
 # =========================
 # 0) 기본 설정 / 재현성
@@ -59,7 +59,7 @@ raw_dset = DatasetDict({
 })
 
 # =========================
-# 2) 모델/토크나이저
+# 2) 모델/토크나이저 (QLoRA)
 # =========================
 MODEL_NAME = "openlm-research/open_llama_3b"
 
@@ -81,28 +81,51 @@ collator = DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8)
 device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
 bf16 = False  # 3090은 bf16 미지원
 
+# ===== QLoRA: 4-bit 로드 + LoRA 어댑터만 학습 =====
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",         # 안정적, 성능 우수
+    bnb_4bit_use_double_quant=True,    # 추가 양자화로 메모리 절감
+    bnb_4bit_compute_dtype=torch.float16
+)
+
 print("모델 로드 전")
-# ✅ 가중치는 FP16으로 로드(메모리 절약) + AMP는 완전 OFF(GradScaler 비사용)
-model = LlamaForSequenceClassification.from_pretrained(
+base_model = LlamaForSequenceClassification.from_pretrained(
     MODEL_NAME,
     num_labels=len(LABELS),
     id2label=id2label,
     label2id=label2id,
-    torch_dtype=torch.float16,     # half로 로드하되 AMP 비사용
+    quantization_config=bnb_config,
+    torch_dtype=torch.float16,           # 컴퓨트 dtype
     low_cpu_mem_usage=True,
+    device_map="auto",                   # 단일 GPU면 자동 배치
 )
 print("모델 로드 후")
 
 # 분류 설정 + 체크포인팅 호환
-model.config.problem_type = "single_label_classification"
-model.config.use_cache = False
-model.gradient_checkpointing_enable()
-if hasattr(model, "enable_input_require_grads"):
-    model.enable_input_require_grads()
+base_model.config.problem_type = "single_label_classification"
+base_model.config.use_cache = False
+base_model.gradient_checkpointing_enable()
 
-# 디버그: half 파라미터 확인
-num_fp16 = sum(1 for p in model.parameters() if p.requires_grad and p.dtype == torch.float16)
-print(f"[CHECK] trainable fp16 params: {num_fp16}")
+# k-bit 학습 전처리
+base_model = prepare_model_for_kbit_training(
+    base_model,
+    use_gradient_checkpointing=True
+)
+
+# LoRA 설정 (LLaMA 계열 권장 타깃 모듈)
+lora_config = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                    "gate_proj", "down_proj", "up_proj"],
+    lora_dropout=0.05,
+    bias="none",
+    task_type="SEQ_CLS"  # sequence classification
+)
+
+model = get_peft_model(base_model, lora_config)
+model.print_trainable_parameters()  # 디버그 출력
 
 # =========================
 # 3) 메트릭
@@ -131,7 +154,7 @@ def auto_steps(n_train_examples, per_device_bsz, grad_acc, n_gpus=1, evals_per_e
 
 N_TRAIN = len(tokenized["train"])
 
-# ✅ 메모리 긴축: 배치 1 + 누적 16 (전역 배치 유지)
+# ✅ 메모리 긴축: 배치 1 + 누적 16
 PER_DEVICE_BSZ = 1
 GRAD_ACC = 16
 
@@ -139,14 +162,14 @@ EVAL_STEPS, STEPS_PER_EPOCH = auto_steps(
     N_TRAIN, PER_DEVICE_BSZ, GRAD_ACC, n_gpus=torch.cuda.device_count(), evals_per_epoch=1
 )
 print(f"[INFO] steps/epoch ≈ {STEPS_PER_EPOCH}, (epoch 기반 평가/저장)")
-print(f"[INFO] device: {device_name}, bf16={bf16}, fp16(AMP 사용)=False  (가중치는 FP16)")
+print(f"[INFO] device: {device_name}, bf16={bf16}, AMP=False (QLoRA)")
 print("step 4 완료")
 
 # =========================
 # 5) 학습 인자
 # =========================
 OUTPUT_DIR = "./llama-emotion-clf"
-LR = 2e-5
+LR = 2e-4         # LoRA에서는 일반 FT보다 학습률을 높게 둬도 안정적
 EPOCHS = 3
 
 args = TrainingArguments(
@@ -160,9 +183,14 @@ args = TrainingArguments(
     gradient_accumulation_steps=GRAD_ACC,
     weight_decay=0.05,
 
-    # ✅ AMP/GradScaler를 절대 쓰지 않으므로 클리핑 0.0 유지(원하면 1.0로 변경 가능)
-    max_grad_norm=0.0,
+    # AMP/GradScaler 비사용
+    fp16=False,
+    bf16=bf16,
 
+    # ✅ bnb paged AdamW 8bit (옵티마이저 상태 메모리 절감)
+    optim="paged_adamw_8bit",
+
+    max_grad_norm=0.0,          # 필요시 1.0로
     lr_scheduler_type="cosine",
     warmup_ratio=0.1,
 
@@ -175,15 +203,10 @@ args = TrainingArguments(
     metric_for_best_model="macro_f1",
     greater_is_better=True,
 
-    # ✅ AMP 완전 OFF
-    fp16=False,
-    bf16=bf16,
-    optim="adamw_torch",           # 가능하면 "adamw_torch_fused"로 교체해도 됨
-
     gradient_checkpointing=True,
     gradient_checkpointing_kwargs={"use_reentrant": False},
 
-    dataloader_num_workers=0,      # 슬럼/포크 환경에서 안전
+    dataloader_num_workers=0,  # 슬럼/포크 환경에서 안전
     report_to="none",
     seed=SEED,
 )
@@ -237,12 +260,11 @@ if DO_TUNE:
     trial_logs = []
 
     def build_args(trial):
-        lr = trial.suggest_float("learning_rate", 8e-6, 4e-5, log=True)
-        wd = trial.suggest_float("weight_decay", 0.01, 0.08)
+        lr = trial.suggest_float("learning_rate", 5e-5, 5e-4, log=True)  # LoRA니까 범위 상향
+        wd = trial.suggest_float("weight_decay", 0.00, 0.08)
         warmup = trial.suggest_float("warmup_ratio", 0.05, 0.2)
         sched = trial.suggest_categorical("lr_scheduler_type", ["linear", "cosine", "cosine_with_restarts"])
-        # AMP를 쓰지 않으므로 클리핑 자유롭게, 일단 0.0 유지
-        grad_norm = trial.suggest_categorical("max_grad_norm", [0.0])
+        grad_norm = trial.suggest_categorical("max_grad_norm", [0.0, 1.0])
         epochs = trial.suggest_categorical("num_train_epochs", [2, 3, 4])
         patience = trial.suggest_categorical("early_stopping_patience", [2, 3])
 
@@ -268,10 +290,10 @@ if DO_TUNE:
             metric_for_best_model="macro_f1",
             greater_is_better=True,
 
-            # ✅ AMP 완전 OFF (트라이얼도 동일 정책)
+            # AMP OFF + 8bit 옵티마이저 유지
             fp16=False,
             bf16=bf16,
-            optim="adamw_torch",
+            optim="paged_adamw_8bit",
 
             gradient_checkpointing=True,
             gradient_checkpointing_kwargs={"use_reentrant": False},
@@ -282,24 +304,36 @@ if DO_TUNE:
         )
         return a, patience
 
-    def objective(trial):
-        # 혹시 모를 외부 설정 방어
+    def build_lora_model():
         os.environ["ACCELERATE_MIXED_PRECISION"] = "no"
 
-        m = LlamaForSequenceClassification.from_pretrained(
+        base = LlamaForSequenceClassification.from_pretrained(
             MODEL_NAME,
             num_labels=len(LABELS),
             id2label=id2label,
             label2id=label2id,
-            torch_dtype=torch.float16,      # half 가중치로 로드
+            quantization_config=bnb_config,
+            torch_dtype=torch.float16,
             low_cpu_mem_usage=True,
+            device_map="auto",
         )
-        m.config.problem_type = "single_label_classification"
-        m.config.use_cache = False
-        m.gradient_checkpointing_enable()
-        if hasattr(m, "enable_input_require_grads"):
-            m.enable_input_require_grads()
+        base.config.problem_type = "single_label_classification"
+        base.config.use_cache = False
+        base.gradient_checkpointing_enable()
+        base = prepare_model_for_kbit_training(base, use_gradient_checkpointing=True)
 
+        lconf = LoraConfig(
+            r=trial.suggest_categorical("lora_r", [8, 16, 32]),
+            lora_alpha=trial.suggest_categorical("lora_alpha", [16, 32, 64]),
+            target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","down_proj","up_proj"],
+            lora_dropout=trial.suggest_float("lora_dropout", 0.0, 0.1),
+            bias="none",
+            task_type="SEQ_CLS",
+        )
+        return get_peft_model(base, lconf)
+
+    def objective(trial):
+        m = build_lora_model()
         a, patience = build_args(trial)
         t = Trainer(
             model=m,
@@ -362,5 +396,6 @@ if DO_TUNE:
     print(topk[[
         "trial","val_f1","val_acc","train_f1","train_acc",
         "learning_rate","weight_decay","warmup_ratio","lr_scheduler_type",
-        "max_grad_norm","num_train_epochs","early_stopping_patience"
+        "max_grad_norm","num_train_epochs","early_stopping_patience",
+        "lora_r","lora_alpha","lora_dropout"
     ]].to_string(index=False))
