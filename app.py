@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 import os, json, re, random, math
+os.environ["TOKENIZERS_PARALLELISM"] = "false"   # 포크 경고/데드락 회피
+
 import numpy as np
 import torch
 import pandas as pd
@@ -24,9 +26,14 @@ torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
-# A100/H100에서 속도↑(수치 안정성 크게 해치지 않음)
+# Ampere(3090)에서 TF32 허용
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
+# =========================
+# (스위치) 정밀도 설정
+# =========================
+USE_FP16 = True   # 문제가 계속되면 False로 내려서 먼저 정상 동작 확인
 
 # =========================
 # 1) 데이터 로드
@@ -40,7 +47,6 @@ val_df = pd.read_excel("./datasets/val.xlsx")
 test_df = pd.read_excel("./datasets/test.xlsx")
 
 def to_hf(ds: pd.DataFrame):
-    # Sentence -> text, Emotion -> label_str
     dset = Dataset.from_pandas(
         ds[["Sentence", "Emotion"]].rename(columns={"Sentence": "text", "Emotion": "label_str"}),
         preserve_index=False
@@ -56,10 +62,10 @@ raw_dset = DatasetDict({
 # =========================
 # 2) 모델/토크나이저
 # =========================
-MODEL_NAME = "openlm-research/open_llama_3b"   # 필요시 교체
-MAX_LEN = 96# 128
+MODEL_NAME = "openlm-research/open_llama_3b"
+MAX_LEN = 96
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)  # (원하면 legacy=False)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -71,36 +77,26 @@ def tok_fn(batch):
 tokenized = raw_dset.map(tok_fn, batched=True, remove_columns=["text", "label_str", "label"])
 collator = DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8)
 
-# 하드웨어 감지 (bf16/fp16/optimizer)
-use_bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8  # A100/H100 계열
-device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else ""
-use_fused = ("A100" in device_name) or ("H100" in device_name)
-fp16 = torch.cuda.is_available()#(not use_bf16) and torch.cuda.is_available()
-bf16 =  False #use_bf16
-optim_name = "adamw_torch" #"adamw_torch_fused" if use_fused else "adamw_hf"
+# 하드웨어 감지
+device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+bf16 = False  # 3090은 bf16 미지원
+fp16 = torch.cuda.is_available() and USE_FP16
 
 print("모델 로드 전")
-# 모델 로드
+# ✅ FP16로 로드(핵심)
 model = LlamaForSequenceClassification.from_pretrained(
     MODEL_NAME,
     num_labels=len(LABELS),
     id2label=id2label,
     label2id=label2id,
-    torch_dtype=torch.float16 if fp16 else torch.float32,  # bf16 제거
+    torch_dtype=torch.float16 if fp16 else torch.float32,
+    low_cpu_mem_usage=True,
 )
-# model = LlamaForSequenceClassification.from_pretrained(
-#     MODEL_NAME,
-#     num_labels=len(LABELS),
-#     id2label=id2label,
-#     label2id=label2id,
-#     torch_dtype=torch.bfloat16 if bf16 else (torch.float16 if fp16 else torch.float32),
-# )
 print("모델 로드 후")
-# 분류 문제 타입 명시
-model.config.problem_type = "single_label_classification"
 
-# 메모리 최적화 옵션
-model.config.use_cache = False      # gradient checkpointing과 충돌 방지
+# 분류 문제 타입 명시 + 체크포인팅 충돌 방지
+model.config.problem_type = "single_label_classification"
+model.config.use_cache = False
 model.gradient_checkpointing_enable()
 
 # =========================
@@ -115,28 +111,29 @@ def compute_metrics(eval_pred):
     preds = np.argmax(logits, axis=-1)
     return {
         "accuracy": acc_metric.compute(predictions=preds, references=labels)["accuracy"],
-        "macro_f1": f1_metric.compute(predictions=preds, references=labels, average="macro")["f1"],  # <-- 키 이름 통일
+        "macro_f1": f1_metric.compute(predictions=preds, references=labels, average="macro")["f1"],
     }
 print("step 3 완료")
+
 # =========================
-# 4) 스텝 자동 계산
+# 4) 스텝 자동 계산(정보 출력용)
 # =========================
-def auto_steps(n_train_examples, per_device_bsz, grad_acc, n_gpus=1, evals_per_epoch=3):
+def auto_steps(n_train_examples, per_device_bsz, grad_acc, n_gpus=1, evals_per_epoch=1):
     global_bsz = per_device_bsz * grad_acc * max(1, n_gpus)
     steps_per_epoch = max(1, math.floor(n_train_examples / global_bsz))
-    step = max(50, steps_per_epoch // max(1, evals_per_epoch))  # 너무 촘촘하지 않게 하한 50
+    step = max(50, steps_per_epoch // max(1, evals_per_epoch))
     return step, steps_per_epoch
 
 N_TRAIN = len(tokenized["train"])
-PER_DEVICE_BSZ =  2#8      # 좋은 GPU면 16까지 시도 가능 (OOM 나면 8)
-GRAD_ACC = 8#2            # 전역 배치 = bsz * acc * n_gpus
+PER_DEVICE_BSZ = 2
+GRAD_ACC = 8
 EVAL_STEPS, STEPS_PER_EPOCH = auto_steps(
     N_TRAIN, PER_DEVICE_BSZ, GRAD_ACC, n_gpus=torch.cuda.device_count(), evals_per_epoch=1
 )
-SAVE_STEPS = EVAL_STEPS
-print(f"[INFO] steps/epoch ≈ {STEPS_PER_EPOCH}, eval_steps={EVAL_STEPS}, save_steps={SAVE_STEPS}")
-print(f"[INFO] device: {device_name}, bf16={bf16}, fp16={fp16}, optim={optim_name}")
+print(f"[INFO] steps/epoch ≈ {STEPS_PER_EPOCH}, (epoch 기반 평가/저장)")
+print(f"[INFO] device: {device_name}, bf16={bf16}, fp16={fp16}")
 print("step 4 완료")
+
 # =========================
 # 5) 학습 인자
 # =========================
@@ -144,47 +141,6 @@ OUTPUT_DIR = "./llama-emotion-clf"
 LR = 2e-5
 EPOCHS = 3
 
-# args = TrainingArguments(
-#     output_dir=OUTPUT_DIR,
-#     overwrite_output_dir=True,
-
-#     # 주요 HP
-#     learning_rate=LR,
-#     num_train_epochs=EPOCHS,
-#     per_device_train_batch_size=PER_DEVICE_BSZ,
-#     per_device_eval_batch_size=PER_DEVICE_BSZ,
-#     gradient_accumulation_steps=GRAD_ACC,
-#     weight_decay=0.05,
-#     max_grad_norm=1.0,
-
-#     # 스케줄러/워밍업
-#     lr_scheduler_type="cosine",
-#     warmup_ratio=0.1,
-
-#     # 평가/저장 주기
-#     evaluation_strategy="steps",
-#     eval_steps=EVAL_STEPS,
-#     save_strategy="steps",
-#     save_steps=SAVE_STEPS,
-#     save_total_limit=2,
-#     logging_steps=100,
-
-#     # 베스트 모델 로드
-#     load_best_model_at_end=True,
-#     metric_for_best_model="macro_f1",   # compute_metrics의 키와 일치
-#     greater_is_better=True,
-
-#     # 정밀도/최적화기
-#     fp16=fp16,
-#     bf16=bf16,
-#     optim=optim_name,
-
-#     # 기타
-#     gradient_checkpointing=True,
-#     dataloader_num_workers=4,
-#     report_to="none",
-#     seed=SEED,
-# )
 args = TrainingArguments(
     output_dir=OUTPUT_DIR,
     overwrite_output_dir=True,
@@ -200,25 +156,31 @@ args = TrainingArguments(
     lr_scheduler_type="cosine",
     warmup_ratio=0.1,
 
-    evaluation_strategy="epoch",   # "steps" → "epoch"
-    save_strategy="epoch",         # "steps" → "epoch"
+    evaluation_strategy="epoch",   # 간단/안정
+    save_strategy="epoch",
+    save_total_limit=2,
     logging_steps=100,
 
     load_best_model_at_end=True,
     metric_for_best_model="macro_f1",
     greater_is_better=True,
 
-    fp16=fp16,
-    bf16=bf16,
-    optim=optim_name,
+    fp16=fp16,          # ✅ FP16 사용
+    bf16=bf16,          # 3090이라 False
+    optim="adamw_torch",
 
     gradient_checkpointing=True,
-    dataloader_num_workers=4,
+    # ✅ AMP와의 충돌 줄이기
+    gradient_checkpointing_kwargs={"use_reentrant": False},
+
+    # ✅ 슬럼/포크 환경 안정화
+    dataloader_num_workers=0,
     report_to="none",
     seed=SEED,
 )
 
 print("step 5 완료")
+
 # =========================
 # 6) Trainer
 # =========================
@@ -233,6 +195,7 @@ trainer = Trainer(
     callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
 )
 print("step 6 완료")
+
 # =========================
 # 7) 학습/평가/저장
 # =========================
@@ -252,19 +215,17 @@ final_dir = os.path.join(OUTPUT_DIR, "final")
 trainer.save_model(final_dir)
 tokenizer.save_pretrained(final_dir)
 print("step 7/학습 완료")
+
 # =========================
-# (옵션) 8) Optuna 스윕으로 튜닝 (개선판)
+# (옵션) 8) Optuna 스윕
 # =========================
 print("step 8 튜닝 시작 완료")
 DO_TUNE = True
 
 if DO_TUNE:
-    import copy, optuna
+    import optuna
 
-    # 각 trial 로그 적재용
     trial_logs = []
-
-    orig_sd = copy.deepcopy(model.state_dict())
 
     def build_args(trial):
         lr = trial.suggest_float("learning_rate", 8e-6, 4e-5, log=True)
@@ -289,8 +250,8 @@ if DO_TUNE:
             num_train_epochs=epochs,
             max_grad_norm=grad_norm,
 
-            evaluation_strategy="epoch",   # here
-            save_strategy="epoch",         # here
+            evaluation_strategy="epoch",
+            save_strategy="epoch",
             save_total_limit=1,
 
             load_best_model_at_end=True,
@@ -299,23 +260,25 @@ if DO_TUNE:
 
             fp16=fp16,
             bf16=bf16,
-            optim=optim_name,
+            optim="adamw_torch",
+
             gradient_checkpointing=True,
-            dataloader_num_workers=4,
+            gradient_checkpointing_kwargs={"use_reentrant": False},
+
+            dataloader_num_workers=0,
             report_to="none",
             seed=SEED,
         )
-
         return a, patience
 
     def objective(trial):
-        # ⬇ 각 trial마다 새 모델 로드
         m = LlamaForSequenceClassification.from_pretrained(
             MODEL_NAME,
             num_labels=len(LABELS),
             id2label=id2label,
             label2id=label2id,
             torch_dtype=torch.float16 if fp16 else torch.float32,
+            low_cpu_mem_usage=True,
         )
         m.config.problem_type = "single_label_classification"
         m.config.use_cache = False
@@ -338,7 +301,6 @@ if DO_TUNE:
         train_metrics = t.evaluate(tokenized["train"])
         val_metrics = t.evaluate(tokenized["validation"])
 
-        # 콘솔 로그
         print(
             f"[Trial {trial.number}] "
             f"Train Acc: {train_metrics['eval_accuracy']:.4f}, "
@@ -347,45 +309,37 @@ if DO_TUNE:
             f"Val F1: {val_metrics['eval_macro_f1']:.4f}"
         )
 
-        # Optuna 내부에도 저장(나중에 UI에서 보기 편함)
         trial.set_user_attr("train_acc", train_metrics["eval_accuracy"])
         trial.set_user_attr("train_f1", train_metrics["eval_macro_f1"])
         trial.set_user_attr("val_acc", val_metrics["eval_accuracy"])
         trial.set_user_attr("val_f1", val_metrics["eval_macro_f1"])
 
-        # CSV 저장용 누적
         trial_logs.append({
             "trial": trial.number,
-            **trial.params,  # 샘플링된 하이퍼파라미터들
+            **trial.params,
             "train_acc": train_metrics["eval_accuracy"],
             "train_f1": train_metrics["eval_macro_f1"],
             "val_acc": val_metrics["eval_accuracy"],
             "val_f1": val_metrics["eval_macro_f1"],
         })
 
-        # 최적화 대상(Validation Macro-F1)
-        del t
-        del m
-        import gc, torch
+        # 메모리 정리
+        del t, m
+        import gc
         gc.collect()
         torch.cuda.empty_cache()
 
         return val_metrics["eval_macro_f1"]
 
-    # 스터디 생성 및 최적화
     study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=30, show_progress_bar=True)
 
-    # 결과 요약 출력
     print("Best trial:", study.best_trial.number, study.best_trial.value)
     print("Best params:", study.best_trial.params)
 
-    # CSV 저장
-    import pandas as pd
     df_trials = pd.DataFrame(trial_logs)
     df_trials.to_csv(f"{OUTPUT_DIR}/optuna_results.csv", index=False)
 
-    # 상위 N개 요약(예: 상위 5개)
     topk = df_trials.sort_values("val_f1", ascending=False).head(5)
     print("\n[Top-5 by Val F1]")
     print(topk[[
