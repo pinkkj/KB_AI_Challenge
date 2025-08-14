@@ -110,7 +110,7 @@ def compute_metrics(eval_pred):
         "accuracy": acc_metric.compute(predictions=preds, references=labels)["accuracy"],
         "macro_f1": f1_metric.compute(predictions=preds, references=labels, average="macro")["f1"],  # <-- 키 이름 통일
     }
-
+print("step 3 완료")
 # =========================
 # 4) 스텝 자동 계산
 # =========================
@@ -127,7 +127,7 @@ EVAL_STEPS, STEPS_PER_EPOCH = auto_steps(N_TRAIN, PER_DEVICE_BSZ, GRAD_ACC, n_gp
 SAVE_STEPS = EVAL_STEPS
 print(f"[INFO] steps/epoch ≈ {STEPS_PER_EPOCH}, eval_steps={EVAL_STEPS}, save_steps={SAVE_STEPS}")
 print(f"[INFO] device: {device_name}, bf16={bf16}, fp16={fp16}, optim={optim_name}")
-
+print("step 4 완료")
 # =========================
 # 5) 학습 인자
 # =========================
@@ -176,7 +176,7 @@ args = TrainingArguments(
     report_to="none",
     seed=SEED,
 )
-
+print("step 5 완료")
 # =========================
 # 6) Trainer
 # =========================
@@ -190,7 +190,7 @@ trainer = Trainer(
     compute_metrics=compute_metrics,
     callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
 )
-
+print("step 6 완료")
 # =========================
 # 7) 학습/평가/저장
 # =========================
@@ -209,10 +209,11 @@ print(trainer.evaluate(tokenized["test"]))
 final_dir = os.path.join(OUTPUT_DIR, "final")
 trainer.save_model(final_dir)
 tokenizer.save_pretrained(final_dir)
-
+print("step 7/학습 완료")
 # =========================
 # (옵션) 8) Optuna 스윕으로 튜닝 (개선판)
 # =========================
+print("step 8 튜닝 시작 완료")
 DO_TUNE = True
 
 if DO_TUNE:
