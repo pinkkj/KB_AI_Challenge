@@ -1,10 +1,10 @@
 #!/usr/bin/bash
 
-#SBATCH -J kb-app
-#SBATCH -p debug_ugrad
-#SBATCH --gpus-per-task=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=10G
+#SBATCH -J ksy-love
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-gpu=8
+#SBATCH --mem-per-gpu=32G
+#SBATCH -p batch_ugrad
 #SBATCH -o logs/slurm-%A.out
 
 python app.py
