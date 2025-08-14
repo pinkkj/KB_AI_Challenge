@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 import os, json, re, random, math
-os.environ["TOKENIZERS_PARALLELISM"] = "false"   # 포크 경고/데드락 회피
+os.environ["TOKENIZERS_PARALLELISM"] = "false"   # 포크/데드락 경고 방지
 
 import numpy as np
 import torch
 import pandas as pd
 from datasets import Dataset, DatasetDict
-from sklearn.model_selection import train_test_split
 from transformers import (
     AutoTokenizer,
     LlamaForSequenceClassification,
@@ -26,14 +25,12 @@ torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
-# Ampere(3090)에서 TF32 허용
+# Ampere(3090)에서 TF32로 속도 확보
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-# =========================
-# (스위치) 정밀도 설정
-# =========================
-USE_FP16 = True   # 문제가 계속되면 False로 내려서 먼저 정상 동작 확인
+# ---- 혼합정밀 스위치 (안정 우선) ----
+USE_FP16 = False   # <- 우선 False로 안정 학습. 나중에 True로 바꿔 FP16 재시도
 
 # =========================
 # 1) 데이터 로드
@@ -65,7 +62,8 @@ raw_dset = DatasetDict({
 MODEL_NAME = "openlm-research/open_llama_3b"
 MAX_LEN = 96
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)  # (원하면 legacy=False)
+# (원하면 legacy=False 추가 가능; 버전에 따라 에러 날 수 있어 기본값 유지)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -77,27 +75,28 @@ def tok_fn(batch):
 tokenized = raw_dset.map(tok_fn, batched=True, remove_columns=["text", "label_str", "label"])
 collator = DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8)
 
-# 하드웨어 감지
 device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
 bf16 = False  # 3090은 bf16 미지원
 fp16 = torch.cuda.is_available() and USE_FP16
 
 print("모델 로드 전")
-# ✅ FP16로 로드(핵심)
 model = LlamaForSequenceClassification.from_pretrained(
     MODEL_NAME,
     num_labels=len(LABELS),
     id2label=id2label,
     label2id=label2id,
-    torch_dtype=torch.float16 if fp16 else torch.float32,
+    torch_dtype=torch.float16 if fp16 else torch.float32,  # 현재는 FP32 로드
     low_cpu_mem_usage=True,
 )
 print("모델 로드 후")
 
-# 분류 문제 타입 명시 + 체크포인팅 충돌 방지
+# 분류 설정 + 체크포인팅 호환
 model.config.problem_type = "single_label_classification"
 model.config.use_cache = False
 model.gradient_checkpointing_enable()
+# (일부 LLaMA 계열에서 체크포인팅 시 입력 그래드 필요)
+if hasattr(model, "enable_input_require_grads"):
+    model.enable_input_require_grads()
 
 # =========================
 # 3) 메트릭
@@ -116,7 +115,7 @@ def compute_metrics(eval_pred):
 print("step 3 완료")
 
 # =========================
-# 4) 스텝 자동 계산(정보 출력용)
+# 4) 스텝 정보(출력용)
 # =========================
 def auto_steps(n_train_examples, per_device_bsz, grad_acc, n_gpus=1, evals_per_epoch=1):
     global_bsz = per_device_bsz * grad_acc * max(1, n_gpus)
@@ -156,7 +155,7 @@ args = TrainingArguments(
     lr_scheduler_type="cosine",
     warmup_ratio=0.1,
 
-    evaluation_strategy="epoch",   # 간단/안정
+    evaluation_strategy="epoch",
     save_strategy="epoch",
     save_total_limit=2,
     logging_steps=100,
@@ -165,16 +164,14 @@ args = TrainingArguments(
     metric_for_best_model="macro_f1",
     greater_is_better=True,
 
-    fp16=fp16,          # ✅ FP16 사용
-    bf16=bf16,          # 3090이라 False
+    fp16=fp16,          # 현재 False (안정)
+    bf16=bf16,
     optim="adamw_torch",
 
     gradient_checkpointing=True,
-    # ✅ AMP와의 충돌 줄이기
-    gradient_checkpointing_kwargs={"use_reentrant": False},
+    gradient_checkpointing_kwargs={"use_reentrant": False},  # AMP 충돌 완화
 
-    # ✅ 슬럼/포크 환경 안정화
-    dataloader_num_workers=0,
+    dataloader_num_workers=0,  # 슬럼/포크 환경에서 안전
     report_to="none",
     seed=SEED,
 )
@@ -258,7 +255,7 @@ if DO_TUNE:
             metric_for_best_model="macro_f1",
             greater_is_better=True,
 
-            fp16=fp16,
+            fp16=fp16,   # 현재 False
             bf16=bf16,
             optim="adamw_torch",
 
@@ -283,6 +280,8 @@ if DO_TUNE:
         m.config.problem_type = "single_label_classification"
         m.config.use_cache = False
         m.gradient_checkpointing_enable()
+        if hasattr(m, "enable_input_require_grads"):
+            m.enable_input_require_grads()
 
         a, patience = build_args(trial)
         t = Trainer(
