@@ -211,14 +211,15 @@ trainer.save_model(final_dir)
 tokenizer.save_pretrained(final_dir)
 
 # =========================
-# (옵션) 8) Optuna 스윕으로 튜닝
+# (옵션) 8) Optuna 스윕으로 튜닝 (개선판)
 # =========================
-# 사용하려면 아래 DO_TUNE=True 로 변경하고 optuna 설치 후 실행:
-#   !pip install optuna
-DO_TUNE = False
+DO_TUNE = True
 
 if DO_TUNE:
     import copy, optuna
+
+    # 각 trial 로그 적재용
+    trial_logs = []
 
     orig_sd = copy.deepcopy(model.state_dict())
 
@@ -266,7 +267,7 @@ if DO_TUNE:
         return a, patience
 
     def objective(trial):
-        # 매 트라이얼마다 모델 파라미터 리셋
+        # 모델 초기화
         model.load_state_dict(orig_sd)
 
         a, patience = build_args(trial)
@@ -280,12 +281,60 @@ if DO_TUNE:
             compute_metrics=compute_metrics,
             callbacks=[EarlyStoppingCallback(early_stopping_patience=patience)],
         )
-        t.train()
-        metrics = t.evaluate(tokenized["validation"])
-        return metrics["eval_macro_f1"]
 
+        # 학습
+        t.train()
+
+        # 평가(Trainer.evaluate는 eval_ 접두사를 붙여 반환)
+        train_metrics = t.evaluate(tokenized["train"])
+        val_metrics = t.evaluate(tokenized["validation"])
+
+        # 콘솔 로그
+        print(
+            f"[Trial {trial.number}] "
+            f"Train Acc: {train_metrics['eval_accuracy']:.4f}, "
+            f"Train F1: {train_metrics['eval_macro_f1']:.4f} | "
+            f"Val Acc: {val_metrics['eval_accuracy']:.4f}, "
+            f"Val F1: {val_metrics['eval_macro_f1']:.4f}"
+        )
+
+        # Optuna 내부에도 저장(나중에 UI에서 보기 편함)
+        trial.set_user_attr("train_acc", train_metrics["eval_accuracy"])
+        trial.set_user_attr("train_f1", train_metrics["eval_macro_f1"])
+        trial.set_user_attr("val_acc", val_metrics["eval_accuracy"])
+        trial.set_user_attr("val_f1", val_metrics["eval_macro_f1"])
+
+        # CSV 저장용 누적
+        trial_logs.append({
+            "trial": trial.number,
+            **trial.params,  # 샘플링된 하이퍼파라미터들
+            "train_acc": train_metrics["eval_accuracy"],
+            "train_f1": train_metrics["eval_macro_f1"],
+            "val_acc": val_metrics["eval_accuracy"],
+            "val_f1": val_metrics["eval_macro_f1"],
+        })
+
+        # 최적화 대상(Validation Macro-F1)
+        return val_metrics["eval_macro_f1"]
+
+    # 스터디 생성 및 최적화
     study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=30, show_progress_bar=True)
 
+    # 결과 요약 출력
     print("Best trial:", study.best_trial.number, study.best_trial.value)
     print("Best params:", study.best_trial.params)
+
+    # CSV 저장
+    import pandas as pd
+    df_trials = pd.DataFrame(trial_logs)
+    df_trials.to_csv(f"{OUTPUT_DIR}/optuna_results.csv", index=False)
+
+    # 상위 N개 요약(예: 상위 5개)
+    topk = df_trials.sort_values("val_f1", ascending=False).head(5)
+    print("\n[Top-5 by Val F1]")
+    print(topk[[
+        "trial","val_f1","val_acc","train_f1","train_acc",
+        "learning_rate","weight_decay","warmup_ratio","lr_scheduler_type",
+        "max_grad_norm","num_train_epochs","early_stopping_patience"
+    ]].to_string(index=False))
