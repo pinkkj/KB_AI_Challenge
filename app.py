@@ -29,8 +29,8 @@ if torch.cuda.is_available():
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-# ---- 혼합정밀 스위치 (안정 우선) ----
-USE_FP16 = False   # <- 우선 False로 안정 학습. 나중에 True로 바꿔 FP16 재시도
+# ---- 혼합정밀 스위치 (메모리 절약 위해 True) ----
+USE_FP16 = True
 
 # =========================
 # 1) 데이터 로드
@@ -60,9 +60,10 @@ raw_dset = DatasetDict({
 # 2) 모델/토크나이저
 # =========================
 MODEL_NAME = "openlm-research/open_llama_3b"
-MAX_LEN = 96
 
-# (원하면 legacy=False 추가 가능; 버전에 따라 에러 날 수 있어 기본값 유지)
+# 메모리 완화: 시퀀스 길이 단축 (필요하면 64로)
+MAX_LEN = 80
+
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
@@ -85,7 +86,7 @@ model = LlamaForSequenceClassification.from_pretrained(
     num_labels=len(LABELS),
     id2label=id2label,
     label2id=label2id,
-    torch_dtype=torch.float16 if fp16 else torch.float32,  # 현재는 FP32 로드
+    torch_dtype=torch.float16 if fp16 else torch.float32,  # ✅ FP16 로드로 메모리 절약
     low_cpu_mem_usage=True,
 )
 print("모델 로드 후")
@@ -94,7 +95,6 @@ print("모델 로드 후")
 model.config.problem_type = "single_label_classification"
 model.config.use_cache = False
 model.gradient_checkpointing_enable()
-# (일부 LLaMA 계열에서 체크포인팅 시 입력 그래드 필요)
 if hasattr(model, "enable_input_require_grads"):
     model.enable_input_require_grads()
 
@@ -124,8 +124,11 @@ def auto_steps(n_train_examples, per_device_bsz, grad_acc, n_gpus=1, evals_per_e
     return step, steps_per_epoch
 
 N_TRAIN = len(tokenized["train"])
-PER_DEVICE_BSZ = 2
-GRAD_ACC = 8
+
+# ✅ 메모리 긴축: 배치 1 + 누적 16 (전역 배치 유지)
+PER_DEVICE_BSZ = 1
+GRAD_ACC = 16
+
 EVAL_STEPS, STEPS_PER_EPOCH = auto_steps(
     N_TRAIN, PER_DEVICE_BSZ, GRAD_ACC, n_gpus=torch.cuda.device_count(), evals_per_epoch=1
 )
@@ -150,7 +153,9 @@ args = TrainingArguments(
     per_device_eval_batch_size=PER_DEVICE_BSZ,
     gradient_accumulation_steps=GRAD_ACC,
     weight_decay=0.05,
-    max_grad_norm=1.0,
+
+    # ✅ AMP unscale 경로 우회 (클리핑 off)
+    max_grad_norm=0.0,
 
     lr_scheduler_type="cosine",
     warmup_ratio=0.1,
@@ -164,12 +169,12 @@ args = TrainingArguments(
     metric_for_best_model="macro_f1",
     greater_is_better=True,
 
-    fp16=fp16,          # 현재 False (안정)
+    fp16=fp16,          # ✅ FP16 on
     bf16=bf16,
     optim="adamw_torch",
 
     gradient_checkpointing=True,
-    gradient_checkpointing_kwargs={"use_reentrant": False},  # AMP 충돌 완화
+    gradient_checkpointing_kwargs={"use_reentrant": False},
 
     dataloader_num_workers=0,  # 슬럼/포크 환경에서 안전
     report_to="none",
@@ -229,7 +234,7 @@ if DO_TUNE:
         wd = trial.suggest_float("weight_decay", 0.01, 0.08)
         warmup = trial.suggest_float("warmup_ratio", 0.05, 0.2)
         sched = trial.suggest_categorical("lr_scheduler_type", ["linear", "cosine", "cosine_with_restarts"])
-        grad_norm = trial.suggest_float("max_grad_norm", 0.6, 1.5)
+        grad_norm = trial.suggest_categorical("max_grad_norm", [0.0])  # ✅ 고정(AMP 충돌 회피)
         epochs = trial.suggest_categorical("num_train_epochs", [2, 3, 4])
         patience = trial.suggest_categorical("early_stopping_patience", [2, 3])
 
@@ -255,7 +260,7 @@ if DO_TUNE:
             metric_for_best_model="macro_f1",
             greater_is_better=True,
 
-            fp16=fp16,   # 현재 False
+            fp16=fp16,
             bf16=bf16,
             optim="adamw_torch",
 
