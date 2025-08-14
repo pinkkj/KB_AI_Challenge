@@ -79,6 +79,7 @@ fp16 = (not use_bf16) and torch.cuda.is_available()
 bf16 = use_bf16
 optim_name = "adamw_torch_fused" if use_fused else "adamw_hf"
 
+print("모델 로드 전")
 # 모델 로드
 model = LlamaForSequenceClassification.from_pretrained(
     MODEL_NAME,
@@ -87,6 +88,7 @@ model = LlamaForSequenceClassification.from_pretrained(
     label2id=label2id,
     torch_dtype=torch.bfloat16 if bf16 else (torch.float16 if fp16 else torch.float32),
 )
+print("모델 로드 후")
 # 분류 문제 타입 명시
 model.config.problem_type = "single_label_classification"
 
