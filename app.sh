@@ -1,10 +1,10 @@
 #!/usr/bin/bash
 
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-gpu=8
-#SBATCH --mem-per-gpu=10G
+#SBATCH -J kb-app
 #SBATCH -p debug_ugrad
-#SBATCH -w aurora-g3
+#SBATCH --gpus-per-task=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=10G
 #SBATCH -o logs/slurm-%A.out
 
 python app.py
