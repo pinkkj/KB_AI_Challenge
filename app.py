@@ -19,18 +19,13 @@ from transformers import (
 # 0) 기본 설정 / 재현성
 # =========================
 SEED = 42
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
 # Ampere(3090)에서 TF32로 속도 확보
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-
-# ---- 혼합정밀 스위치 (메모리 절약 위해 True) ----
-USE_FP16 = True
 
 # =========================
 # 1) 데이터 로드
@@ -61,7 +56,7 @@ raw_dset = DatasetDict({
 # =========================
 MODEL_NAME = "openlm-research/open_llama_3b"
 
-# 메모리 완화: 시퀀스 길이 단축 (필요하면 64로)
+# 메모리 완화: 시퀀스 길이 단축 (필요시 64로 더 낮추기)
 MAX_LEN = 80
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
@@ -78,15 +73,15 @@ collator = DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8)
 
 device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
 bf16 = False  # 3090은 bf16 미지원
-fp16 = torch.cuda.is_available() and USE_FP16
 
 print("모델 로드 전")
+# ✅ 항상 FP16 가중치로 로드 (메모리 절약) — AMP는 끈다
 model = LlamaForSequenceClassification.from_pretrained(
     MODEL_NAME,
     num_labels=len(LABELS),
     id2label=id2label,
     label2id=label2id,
-    torch_dtype=torch.float16 if fp16 else torch.float32,  # ✅ FP16 로드로 메모리 절약
+    torch_dtype=torch.float16,     # <-- 항상 half로 로드
     low_cpu_mem_usage=True,
 )
 print("모델 로드 후")
@@ -97,6 +92,10 @@ model.config.use_cache = False
 model.gradient_checkpointing_enable()
 if hasattr(model, "enable_input_require_grads"):
     model.enable_input_require_grads()
+
+# 디버그: half 파라미터 확인
+num_fp16 = sum(1 for p in model.parameters() if p.requires_grad and p.dtype == torch.float16)
+print(f"[CHECK] trainable fp16 params: {num_fp16}")
 
 # =========================
 # 3) 메트릭
@@ -133,7 +132,7 @@ EVAL_STEPS, STEPS_PER_EPOCH = auto_steps(
     N_TRAIN, PER_DEVICE_BSZ, GRAD_ACC, n_gpus=torch.cuda.device_count(), evals_per_epoch=1
 )
 print(f"[INFO] steps/epoch ≈ {STEPS_PER_EPOCH}, (epoch 기반 평가/저장)")
-print(f"[INFO] device: {device_name}, bf16={bf16}, fp16={fp16}")
+print(f"[INFO] device: {device_name}, bf16={bf16}, fp16(AMP 사용)=False  (가중치는 FP16)")
 print("step 4 완료")
 
 # =========================
@@ -154,7 +153,7 @@ args = TrainingArguments(
     gradient_accumulation_steps=GRAD_ACC,
     weight_decay=0.05,
 
-    # ✅ AMP unscale 경로 우회 (클리핑 off)
+    # ✅ GradScaler 경로 자체를 사용하지 않으므로 클리핑 off 유지(원하면 1.0으로 켜도 됨)
     max_grad_norm=0.0,
 
     lr_scheduler_type="cosine",
@@ -169,7 +168,8 @@ args = TrainingArguments(
     metric_for_best_model="macro_f1",
     greater_is_better=True,
 
-    fp16=fp16,          # ✅ FP16 on
+    # ✅ AMP/GradScaler 완전 OFF
+    fp16=False,
     bf16=bf16,
     optim="adamw_torch",
 
@@ -234,7 +234,8 @@ if DO_TUNE:
         wd = trial.suggest_float("weight_decay", 0.01, 0.08)
         warmup = trial.suggest_float("warmup_ratio", 0.05, 0.2)
         sched = trial.suggest_categorical("lr_scheduler_type", ["linear", "cosine", "cosine_with_restarts"])
-        grad_norm = trial.suggest_categorical("max_grad_norm", [0.0])  # ✅ 고정(AMP 충돌 회피)
+        # AMP를 쓰지 않으므로 클리핑 자유롭게, 일단 0.0 유지
+        grad_norm = trial.suggest_categorical("max_grad_norm", [0.0])
         epochs = trial.suggest_categorical("num_train_epochs", [2, 3, 4])
         patience = trial.suggest_categorical("early_stopping_patience", [2, 3])
 
@@ -260,7 +261,7 @@ if DO_TUNE:
             metric_for_best_model="macro_f1",
             greater_is_better=True,
 
-            fp16=fp16,
+            fp16=False,
             bf16=bf16,
             optim="adamw_torch",
 
@@ -279,7 +280,7 @@ if DO_TUNE:
             num_labels=len(LABELS),
             id2label=id2label,
             label2id=label2id,
-            torch_dtype=torch.float16 if fp16 else torch.float32,
+            torch_dtype=torch.float16,      # half 가중치로 로드
             low_cpu_mem_usage=True,
         )
         m.config.problem_type = "single_label_classification"
